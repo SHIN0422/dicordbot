@@ -6,17 +6,12 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
-# [중요] 테스트할 서버 ID를 여기에 입력하세요.
-# 서버 ID는 서버 아이콘 우클릭 -> '서버 ID 복사'로 얻을 수 있습니다. (개발자 모드 활성화 필요)
 logging.basicConfig(level=logging.INFO)
 
-# 환경변수에서 GUILD ID와 TOKEN 불러오기 (없으면 기본값 사용)
-TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "1317122769942478878"))
+TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "1106593262631932055"))
 GUILD_OBJECT = discord.Object(id=TEST_GUILD_ID)
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-
-# --- YTDL 및 FFmpeg 설정 (기존과 동일) ---
 youtube_dl.utils.bug_reports_message = lambda *args, **kwargs: ''
 
 ytdl_format_options = {
@@ -58,14 +53,13 @@ class YTDLSource(discord.PCMVolumeTransformer):
         filename = data['url'] if stream else ytdl.prepare_filename(data)
         return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
 
-# --- Music Cog (모든 버그가 수정된 최종 버전) ---
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.song_queue = {}
         self.now_playing = {}
         self.repeat_mode = {}
-        self.is_skipping = {} # 스킵 여부 추적
+        self.is_skipping = {}
 
     async def play_next(self, interaction: discord.Interaction):
         guild_id = interaction.guild.id
@@ -74,18 +68,15 @@ class Music(commands.Cog):
             await interaction.response.send_message("❌ 먼저 /입장 으로 음성 채널에 들어가 주세요.", ephemeral=True)
             return
 
-        # 스킵으로 호출된 경우, 반복 로직을 실행하지 않음
         if self.is_skipping.get(guild_id):
             self.is_skipping[guild_id] = False
         
-        # 노래가 자연스럽게 끝난 경우에만 반복 로직 실행
         else:
             last_song = self.now_playing.get(guild_id)
             mode = self.repeat_mode.get(guild_id, "off")
 
             if last_song and mode != "off":
                 try:
-                    # [핵심] 재사용 불가능한 스트림 대신 새로운 스트림을 생성
                     fresh_player = await YTDLSource.from_url(last_song.data['webpage_url'], loop=self.bot.loop, stream=True)
                     if mode == "one":
                         self.song_queue.setdefault(guild_id, []).insert(0, fresh_player)
@@ -97,10 +88,16 @@ class Music(commands.Cog):
         queue = self.song_queue.get(guild_id)
         if queue:
             song = queue.pop(0)
-            callback = lambda e: asyncio.run_coroutine_threadsafe(self.play_next(interaction), self.bot.loop)
-            voice_client.play(song, after=callback)
-            self.now_playing[guild_id] = song
-            await interaction.channel.send(f"🎵 **재생 시작:** {song.title}")
+            
+            try:
+                fresh_song = await YTDLSource.from_url(song.data['webpage_url'], loop=self.bot.loop, stream=True)
+                callback = lambda e: asyncio.run_coroutine_threadsafe(self.play_next(interaction), self.bot.loop)
+                voice_client.play(fresh_song, after=callback)
+                self.now_playing[guild_id] = fresh_song
+                await interaction.channel.send(f"🎵 **재생 시작:** {fresh_song.title}")
+            except Exception as e:
+                await interaction.channel.send(f"⚠️ 재생 중 오류가 발생했습니다: {e}")
+                await self.play_next(interaction)
         else:
             self.now_playing[guild_id] = None
             await interaction.channel.send("✅ 모든 대기열 재생이 끝났습니다.")
@@ -124,7 +121,6 @@ class Music(commands.Cog):
             await interaction.response.send_message("먼저 음성 채널에 들어가주세요!", ephemeral=True)
             return
         
-        # [핵심] 시간이 오래 걸리는 작업 전에 defer()를 호출해 3초 제한을 피합니다.
         await interaction.response.defer(ephemeral=True)
 
         vc = interaction.guild.voice_client
@@ -163,7 +159,7 @@ class Music(commands.Cog):
     async def skip(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
-            self.is_skipping[interaction.guild.id] = True # 스킵 상태임을 표시
+            self.is_skipping[interaction.guild.id] = True
             vc.stop()
             await interaction.response.send_message("⏭️ 현재 노래를 건너뛰었습니다.")
         else:
@@ -241,30 +237,39 @@ class Music(commands.Cog):
         else:
             await interaction.response.send_message("현재 대기열이 비어있습니다.")
 
-# ---------------------- 봇 초기화 (슬래시 커맨드 방식) ----------------------
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix='/', # 접두사는 더 이상 필요 없지만 형식상 유지
+            command_prefix='/',
             intents=discord.Intents.all()
         )
     
-    # [중요] 봇이 처음 시작될 때 Cog를 로드하고 커맨드를 동기화하는 부분
     async def setup_hook(self):
         await self.add_cog(Music(self))
-        # 특정 길드에만 커맨드를 동기화 (테스트 시 매우 빠름)
         self.tree.copy_global_to(guild=GUILD_OBJECT)
-        await self.tree.sync(guild=GUILD_OBJECT)
-        # 만약 모든 서버에 적용하려면 위 두 줄을 아래 한 줄로 대체 (최대 1시간 소요)
-        # await self.tree.sync()
+        synced = await self.tree.sync(guild=GUILD_OBJECT)
+        logging.info(f"Synced {len(synced)} commands to guild {TEST_GUILD_ID}")
 
     async def on_ready(self):
+        if not discord.opus.is_loaded():
+            try:
+                discord.opus.load_opus('libopus.so.0')
+                logging.info("Opus loaded successfully from libopus.so.0")
+            except:
+                try:
+                    discord.opus.load_opus('opus')
+                    logging.info("Opus loaded successfully from opus")
+                except Exception as e:
+                    logging.error(f"Failed to load opus: {e}")
+        else:
+            logging.info("Opus already loaded")
+        
         print(f'{self.user} (ID: {self.user.id}) 가 준비되었습니다.')
+        print(f'Guild ID: {TEST_GUILD_ID}')
         print('='*20)
 
 bot = MyBot()
 
-# keep-alive 서버 (Replit) 를 import해서 실행 (keep_alive.py가 필요)
 try:
     from keep_alive import keep_alive
     keep_alive()
