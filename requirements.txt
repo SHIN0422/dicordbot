@@ -2,3 +2,6 @@ discord.py
 yt-dlp
 flask
 PyNaCl
+discord.py
+flask
+yt-dlp
